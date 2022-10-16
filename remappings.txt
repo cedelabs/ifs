@@ -1,1 +1,3 @@
-aave-v3-core/=lib/aave-v3-core/contracts
+@aave-v3=lib/aave-v3-core/contracts
+@openzeppelin=lib/openzeppelin-contracts/contracts
+@chainlink=lib/chainlink/contracts/src/v0.8/

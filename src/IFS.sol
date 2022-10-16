@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.0;
+import "@openzeppelin/interfaces/IERC20.sol";
+import "@openzeppelin/utils/structs/DoubleEndedQueue.sol";
+import "@chainlink/KeeperCompatible.sol";
+import "@aave-v3/interfaces/IPoolAddressesProvider.sol";
+import "@aave-v3/interfaces/IPool.sol";
 
-// KeeperCompatible.sol imports the functions from both ./KeeperBase.sol and
-// ./interfaces/KeeperCompatibleInterface.sol
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@chainlink/contracts/src/v0.8/KeeperCompatible.sol";
-import "aave-v3-core/interfaces/IPoolAddressesProvider.sol";
-import "aave-v3-core/interfaces/IPool.sol";
+error ForwardPerUserLimitReached(uint16 maxForwards);
 
 contract IFS is KeeperCompatibleInterface {
+    event ForwardExecuted(
+        address indexed pool,
+        address indexed investor,
+        uint256 indexed transferAmount,
+        uint256 timestamp
+    );
 
-    event KeeperTransferred(address indexed pool, address indexed investor, uint256 indexed transferAmount, uint256 timestamp);
-    event PendingTxAdded(address indexed pool, address indexed investor, uint256 indexed transferAmount, uint256 timestamp);
+    event PendingForwardAdded(
+        address indexed pool,
+        address indexed investor,
+        uint256 indexed transferAmount,
+        uint256 timestamp
+    );
 
-    struct Investment {
+    struct Forward {
         address pool;
         address token;
         uint256 amount;
@@ -24,36 +32,83 @@ contract IFS is KeeperCompatibleInterface {
         State status;
     }
 
-    enum State { transferPending, transferExecuted}
+    enum State {
+        transferPending,
+        transferExecuted
+    }
+
+    uint16 public constant MAX_FORWARDS_PER_BATCH = 100; // TODO calculate precisely
+    uint16 public constant MAX_FORWARDS_PER_USER = 100; // TODO calculate precisely
 
     address public owner;
     address public poolAddressesProvider;
 
-    mapping(address => Investment[]) investments;
+    mapping(address => Forward[]) forwardsByAddress;
     address[] users;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner);
+        _;
+    }
 
     constructor(address _owner, address _poolAddressesProvider) {
         owner = _owner;
         poolAddressesProvider = _poolAddressesProvider;
     }
 
-    function addPendingTx(address _pool, address _token, uint256 _amount) public {
-        Investment memory investment = Investment(_pool, _token, _amount, block.timestamp, State.transferPending);
-        investments[msg.sender].push(investment);
+    function addPendingForward(
+        address _pool,
+        address _token,
+        uint256 _amount
+    ) public {
+        if (forwardsByAddress[msg.sender].length >= MAX_FORWARDS_PER_USER)
+            revert ForwardPerUserLimitReached({
+                maxForwards: MAX_FORWARDS_PER_USER
+            });
+
+        Forward memory forward = Forward(
+            _pool,
+            _token,
+            _amount,
+            block.timestamp,
+            State.transferPending
+        );
+        forwardsByAddress[msg.sender].push(forward);
         users.push(msg.sender);
-        emit PendingTxAdded(_pool, msg.sender, _amount, block.timestamp);
+        emit PendingForwardAdded(_pool, msg.sender, _amount, block.timestamp);
     }
 
     // TODO add time limits on every user
-    function checkUpkeep(bytes calldata) public override view returns (bool upkeepNeeded, bytes memory performData) {
-        for (uint i=0; i<users.length; i++) {
-            for (uint j = 0; j < investments[users[i]].length; j++) {
-                Investment storage investment = investments[users[i]][j];
-                if (investment.status == State.transferPending) {
+    // unbounded loop is used only for this view function
+    function checkUpkeep(bytes calldata)
+        public
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        for (uint256 i = 0; i < users.length; i++) {
+            for (uint256 j = 0; j < forwardsByAddress[users[i]].length; j++) {
+                Forward storage forward = forwardsByAddress[users[i]][j];
+                if (forward.status == State.transferPending) {
                     // check balance && allowance
-                    if (ERC20(investment.token).balanceOf(users[i]) > 0 ||
-                        ERC20(investment.token).allowance(users[i], address(this)) > 0) {
-                        return (true, abi.encode(investment.pool, users[i], investment.token, investment.amount));
+                    if (
+                        IERC20(forward.token).balanceOf(users[i]) >=
+                        forward.amount ||
+                        IERC20(forward.token).allowance(
+                            users[i],
+                            address(this)
+                        ) >=
+                        forward.amount
+                    ) {
+                        return (
+                            true,
+                            abi.encode(
+                                forward.pool,
+                                users[i],
+                                forward.token,
+                                forward.amount
+                            )
+                        );
                     }
                 }
             }
@@ -62,30 +117,60 @@ contract IFS is KeeperCompatibleInterface {
     }
 
     function performUpkeep(bytes calldata performData) external override {
-        (address pool, address investor, address token, uint256 amount) = abi.decode(performData, (address, address, address, uint));
+        (address pool, address investor, address token, uint256 amount) = abi
+            .decode(performData, (address, address, address, uint256));
         supplyAave(pool, investor, token, amount);
     }
 
-    function supplyAave(address _pool, address _investor, address _token, uint256 _amount) internal {
-        for (uint i = 0; i < investments[_investor].length; i++) {
-            Investment storage investment = investments[_investor][i];
-            if (investment.pool == _pool && investment.token == _token && investment.amount == _amount) {
-                investment.status = State.transferExecuted;
+    function supplyAave(
+        address _pool,
+        address _investor,
+        address _token,
+        uint256 _amount
+    ) internal {
+        for (uint256 i = 0; i < forwardsByAddress[_investor].length; i++) {
+            Forward storage forward = forwardsByAddress[_investor][i];
+            if (
+                forward.pool == _pool &&
+                forward.token == _token &&
+                forward.amount == _amount
+            ) {
+                forward.status = State.transferExecuted;
 
-                ERC20(_token).transferFrom(_investor, address(this), _amount);
+                IERC20(_token).transferFrom(_investor, address(this), _amount);
 
                 // https://docs.aave.com/developers/deployed-contracts/v3-testnet-addresses
-                IPoolAddressesProvider provider = IPoolAddressesProvider(address(poolAddressesProvider));
+                IPoolAddressesProvider provider = IPoolAddressesProvider(
+                    address(poolAddressesProvider)
+                );
                 IPool lendingPool = IPool(provider.getPool());
-                ERC20(_token).approve(provider.getPool(), _amount);
+                IERC20(_token).approve(provider.getPool(), _amount);
 
                 uint16 referral = 0;
                 lendingPool.supply(_token, _amount, _investor, referral);
 
-                emit KeeperTransferred(provider.getPool(), _investor, _amount, block.timestamp);
+                emit ForwardExecuted(
+                    provider.getPool(),
+                    _investor,
+                    _amount,
+                    block.timestamp
+                );
                 break;
             }
         }
     }
-}
 
+    // function cleanExpiredForwards() internal onlyOwner {
+
+    //     uint256 memory indexesToRemove = [];
+
+    //     for (uint256 i = 0; i < users.length; i++) {
+    //         for (uint256 j = 0; j < forwardsByAddress[users[i]].length; j++) {
+    //             Forward storage forward = forwardsByAddress[users[i]][j];
+    //             if (forward.status == State.transferExecuted) {
+    //                 indexesToRemove =
+    //             }
+    //         }
+    //     }
+    // }
+}
