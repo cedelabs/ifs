@@ -37,9 +37,11 @@ contract IFS is KeeperCompatibleInterface {
 
     /**
      * @dev canceledByUser state allows to tag forward as canceled, to avoid its execution when DoubleEndedQueue is being processed.
+     * IMPORTANT to have `forwardExecuted` in first position, as it is used as a default value for uninitialized enum.
      */
     enum State {
-        transferPending,
+        forwardExecuted,
+        forwardPending,
         canceledByUser
     }
 
@@ -82,12 +84,12 @@ contract IFS is KeeperCompatibleInterface {
             _token,
             _amount,
             block.number,
-            State.transferPending,
+            State.forwardPending,
             msg.sender
         );
 
         bytes32 fsHash = keccak256(
-            abi.encodePacked(_pool, _token, _amount, block.number, msg.sender)
+            abi.encode(_pool, _token, _amount, block.number, msg.sender)
         );
         forwardByHash[fsHash] = forward;
         DoubleEndedQueue.pushBack(fsHashesQueue, fsHash);
@@ -118,7 +120,7 @@ contract IFS is KeeperCompatibleInterface {
             // memory or storage?
             Forward memory forward = forwardByHash[fHash];
 
-            if (forward.state == State.transferPending) {
+            if (forward.state == State.forwardPending) {
                 // check balance && allowance
                 if (
                     IERC20(forward.token).balanceOf(forward.owner) >=
@@ -144,9 +146,14 @@ contract IFS is KeeperCompatibleInterface {
             }
         }
 
-        if (fsHashesToExecute.length > 0 || fsHashesToPop.length > 0) {
+        if (fsHashesToExecuteCount > 0 || fsHashesToPopCount > 0) {
             upkeepNeeded = true;
-            performData = abi.encode(fsHashesToExecute, fsHashesToPop);
+            performData = abi.encode(
+                fsHashesToExecute,
+                fsHashesToExecuteCount,
+                fsHashesToPop,
+                fsHashesToPopCount
+            );
         } else {
             upkeepNeeded = false;
             performData = "";
@@ -161,14 +168,35 @@ contract IFS is KeeperCompatibleInterface {
         forwardByHash[fsHashToCancel].state = State.canceledByUser;
     }
 
+    function getUserForwards() public view returns (Forward[] memory, uint16) {
+        Forward[] memory forwards = new Forward[](
+            forwardsCountByUser[msg.sender]
+        );
+        uint16 forwardsCount = 0;
+        for (uint256 i = 0; i < DoubleEndedQueue.length(fsHashesQueue); i++) {
+            bytes32 fHash = DoubleEndedQueue.at(fsHashesQueue, i);
+            Forward memory forward = forwardByHash[fHash];
+            if (
+                forward.owner == msg.sender &&
+                forward.state == State.forwardPending
+            ) {
+                forwards[forwardsCount] = forward;
+                forwardsCount += 1;
+            }
+        }
+        return (forwards, forwardsCount);
+    }
+
     function performUpkeep(bytes calldata performData) external override {
         (
             bytes32[] memory fsHashesToExecute,
-            bytes32[] memory fsHashesToPop
-        ) = abi.decode(performData, (bytes32[], bytes32[]));
+            uint16 fsHashesToExecuteCount,
+            bytes32[] memory fsHashesToPop,
+            uint16 fsHashesToPopCount
+        ) = abi.decode(performData, (bytes32[], uint16, bytes32[], uint16));
 
         // execute forwards
-        for (uint256 i = 0; i < fsHashesToExecute.length; i++) {
+        for (uint256 i = 0; i < fsHashesToExecuteCount; i++) {
             Forward memory forward = forwardByHash[fsHashesToExecute[i]];
             supplyAave(
                 forward.pool,
@@ -181,7 +209,7 @@ contract IFS is KeeperCompatibleInterface {
         }
 
         // delete from mapping
-        for (uint256 i = 0; i < fsHashesToPop.length; i++) {
+        for (uint256 i = 0; i < fsHashesToPopCount; i++) {
             forwardsCountByUser[forwardByHash[fsHashesToPop[i]].owner] -= 1;
             delete forwardByHash[fsHashesToPop[i]];
         }
@@ -190,7 +218,7 @@ contract IFS is KeeperCompatibleInterface {
         while (
             DoubleEndedQueue.length(fsHashesQueue) > 0 &&
             forwardByHash[DoubleEndedQueue.front(fsHashesQueue)].state !=
-            State.transferPending
+            State.forwardPending
         ) {
             DoubleEndedQueue.popFront(fsHashesQueue);
         }

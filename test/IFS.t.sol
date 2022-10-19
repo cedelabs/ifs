@@ -4,6 +4,7 @@ pragma solidity ^0.8.0;
 import "forge-std/Test.sol";
 import "../src/IFS.sol";
 import "@openzeppelin/token/ERC20/IERC20.sol";
+import "./Constants.sol";
 
 contract IFSTest is Test {
     IFS public ifs;
@@ -62,13 +63,29 @@ contract IFSTest is Test {
         );
         assertEq(defiUserBalance, withdrawnAmount);
         assertEq(upkeepNeeded, true);
+
+        bytes32[] memory fsHashesToExecute = new bytes32[](
+            Constants.MAX_FORWARDS_PER_BATCH
+        );
+
+        uint16 fsHashesToExecuteCount = 1;
+        uint16 fsHashesToPopCount = 0;
+        fsHashesToExecute[0] = keccak256(
+            abi.encode(
+                aavePoolAddressesProvider,
+                usdcAddress,
+                investedAmount,
+                block.number,
+                defiUserAddress
+            )
+        );
         assertEq(
             performData,
             abi.encode(
-                aavePoolAddressesProvider,
-                defiUserAddress,
-                usdcAddress,
-                investedAmount
+                fsHashesToExecute,
+                fsHashesToExecuteCount,
+                new bytes32[](Constants.MAX_FORWARDS_PER_BATCH),
+                fsHashesToPopCount
             )
         );
 
@@ -88,4 +105,28 @@ contract IFSTest is Test {
     }
 
     // TODO test maximum forwards per user revert
+
+    function testGetUserForwards() public {
+        vm.startPrank(defiUserAddress);
+        ifs.addPendingForward(aavePoolAddressesProvider, usdcAddress, 10000);
+        (IFS.Forward[] memory forwards, uint16 forwardsCount) = ifs
+            .getUserForwards();
+        vm.stopPrank();
+
+        assertEq(forwardsCount, 1);
+        IFS.Forward memory expectedForward = IFS.Forward(
+            aavePoolAddressesProvider,
+            usdcAddress,
+            10000,
+            block.number,
+            IFS.State.forwardPending,
+            defiUserAddress
+        );
+
+        // In order to compare structs, we need to convert them to bytes
+        assertEq(
+            abi.encode(expectedForward.owner),
+            abi.encode(forwards[0].owner)
+        );
+    }
 }
