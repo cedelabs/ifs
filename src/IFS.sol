@@ -10,6 +10,8 @@ import "@aave-v3/interfaces/IPool.sol";
 error ForwardPerUserLimitReached(uint16 maxForwards);
 error ForwardDoesNotExist();
 error PoolNotWhitelisted(address pool);
+error ForwardAlreadyExecuted();
+error ForwardAlreadyCanceled();
 
 contract IFS is KeeperCompatibleInterface {
     event ForwardExecuted(
@@ -45,7 +47,7 @@ contract IFS is KeeperCompatibleInterface {
         canceledByUser
     }
 
-    uint16 public constant MAX_FORWARDS_PER_BATCH = 100; // TODO calculate precisely
+    uint16 public constant MAX_FORWARDS_PER_BATCH = 5; // TODO calculate precisely
     uint16 public constant MAX_FORWARDS_PER_USER = 100; // TODO calculate precisely
     uint16 public constant FORWARD_EXPIRY_TIME = 100; // 20 min approximately
 
@@ -124,7 +126,7 @@ contract IFS is KeeperCompatibleInterface {
                 // check balance && allowance
                 if (
                     IERC20(forward.token).balanceOf(forward.owner) >=
-                    forward.amount ||
+                    forward.amount &&
                     IERC20(forward.token).allowance(
                         forward.owner,
                         address(this)
@@ -161,9 +163,15 @@ contract IFS is KeeperCompatibleInterface {
         return (upkeepNeeded, performData);
     }
 
-    function cancelForward(bytes32 fsHashToCancel) public {
+    function cancelPendingForward(bytes32 fsHashToCancel) public {
         if (forwardByHash[fsHashToCancel].timestamp == 0)
             revert ForwardDoesNotExist();
+
+        if (forwardByHash[fsHashToCancel].state == State.forwardExecuted)
+            revert ForwardAlreadyExecuted();
+
+        if (forwardByHash[fsHashToCancel].state == State.canceledByUser)
+            revert ForwardAlreadyCanceled();
 
         forwardByHash[fsHashToCancel].state = State.canceledByUser;
     }
